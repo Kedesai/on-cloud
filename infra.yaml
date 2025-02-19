@@ -11,3 +11,22 @@ resources:
     tags:
       Environment: Development
       Project: MyProject
+
+  s3_bucket:
+    name: my-s3-bucket
+    acl: private
+    tags:
+      Environment: Development
+      Project: MyProject
+
+  rds_instance:
+    name: my-rds-instance
+    engine: mysql
+    engine_version: 8.0
+    instance_class: db.t3.micro
+    allocated_storage: 20
+    username: admin
+    password: mypassword
+    tags:
+      Environment: Development
+      Project: MyProject
