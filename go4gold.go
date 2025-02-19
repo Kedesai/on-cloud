@@ -14,6 +14,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/avast/retry-go"
@@ -48,7 +50,42 @@ type Config struct {
 			Password         string            `yaml:"password"`
 			Tags             map[string]string `yaml:"tags"`
 		} `yaml:"rds_instance"`
+		ALB struct {
+			Name            string            `yaml:"name"`
+			Scheme          string            `yaml:"scheme"`
+			Subnets         []string          `yaml:"subnets"`
+			SecurityGroups  []string          `yaml:"security_groups"`
+			Listeners       []Listener        `yaml:"listeners"`
+			TargetGroups    []TargetGroup     `yaml:"target_groups"`
+			Tags            map[string]string `yaml:"tags"`
+		} `yaml:"alb"`
 	} `yaml:"resources"`
+}
+
+// Listener represents an ALB listener
+type Listener struct {
+	Protocol       string `yaml:"protocol"`
+	Port           int32  `yaml:"port"`
+	DefaultAction  Action `yaml:"default_action"`
+}
+
+// Action represents a listener action
+type Action struct {
+	Type          string `yaml:"type"`
+	TargetGroup   string `yaml:"target_group"`
+}
+
+// TargetGroup represents an ALB target group
+type TargetGroup struct {
+	Name                 string `yaml:"name"`
+	Protocol             string `yaml:"protocol"`
+	Port                 int32  `yaml:"port"`
+	HealthCheckPath      string `yaml:"health_check_path"`
+	HealthCheckPort      int32  `yaml:"health_check_port"`
+	HealthCheckInterval  int32  `yaml:"health_check_interval"`
+	HealthCheckTimeout   int32  `yaml:"health_check_timeout"`
+	HealthyThreshold     int32  `yaml:"healthy_threshold"`
+	UnhealthyThreshold   int32  `yaml:"unhealthy_threshold"`
 }
 
 func main() {
@@ -81,6 +118,7 @@ func main() {
 	ec2Client := ec2.NewFromConfig(awsCfg)
 	s3Client := s3.NewFromConfig(awsCfg)
 	rdsClient := rds.NewFromConfig(awsCfg)
+	albClient := elasticloadbalancingv2.NewFromConfig(awsCfg)
 
 	// Handle EC2 Instance
 	if cfg.Resources.EC2Instance.Name != "" {
@@ -105,25 +143,32 @@ func main() {
 			log.Printf("Failed to handle RDS instance: %v", err)
 		}
 	}
+
+	// Handle ALB
+	if cfg.Resources.ALB.Name != "" {
+		err = handleALB(albClient, cfg.Resources.ALB)
+		if err != nil {
+			log.Printf("Failed to handle ALB: %v", err)
+		}
+	}
 }
 
-// handleEC2Instance manages the EC2 instance
-func handleEC2Instance(client *ec2.Client, desired ConfigResourcesEC2Instance) error {
-	instanceID, currentState, err := findInstanceByName(client, desired.Name)
+// handleALB manages the Application Load Balancer
+func handleALB(client *elasticloadbalancingv2.Client, desired ConfigResourcesALB) error {
+	albARN, currentState, err := findALBByName(client, desired.Name)
 	if err != nil {
-		return fmt.Errorf("failed to check for existing EC2 instance: %v", err)
+		return fmt.Errorf("failed to check for existing ALB: %v", err)
 	}
 
-	if instanceID != "" {
-		fmt.Printf("EC2 instance already exists with ID: %s\n", instanceID)
+	if albARN != "" {
+		fmt.Printf("ALB already exists with ARN: %s\n", albARN)
 		fmt.Println("Current State:")
-		fmt.Printf("  Instance Type: %s\n", *currentState.InstanceType)
-		fmt.Printf("  AMI: %s\n", *currentState.ImageId)
-		fmt.Printf("  Key Name: %s\n", *currentState.KeyName)
+		fmt.Printf("  Scheme: %s\n", *currentState.Scheme)
+		fmt.Printf("  Subnets: %v\n", currentState.AvailabilityZones)
 		fmt.Printf("  Security Groups: %v\n", currentState.SecurityGroups)
 		fmt.Printf("  Tags: %v\n", currentState.Tags)
 
-		changes := compareEC2States(currentState, desired)
+		changes := compareALBStates(currentState, desired)
 		if len(changes) > 0 {
 			fmt.Println("\nChanges to be applied:")
 			for _, change := range changes {
@@ -135,9 +180,9 @@ func handleEC2Instance(client *ec2.Client, desired ConfigResourcesEC2Instance) e
 			fmt.Scanln(&approval)
 
 			if approval == "yes" {
-				err = updateEC2Instance(client, instanceID, desired)
+				err = updateALB(client, albARN, desired)
 				if err != nil {
-					return fmt.Errorf("failed to update EC2 instance: %v", err)
+					return fmt.Errorf("failed to update ALB: %v", err)
 				}
 				fmt.Println("Changes applied successfully.")
 			} else {
@@ -147,157 +192,133 @@ func handleEC2Instance(client *ec2.Client, desired ConfigResourcesEC2Instance) e
 			fmt.Println("No changes required.")
 		}
 	} else {
-		instanceID, err = createEC2Instance(client, desired)
+		albARN, err = createALB(client, desired)
 		if err != nil {
-			return fmt.Errorf("failed to create EC2 instance: %v", err)
+			return fmt.Errorf("failed to create ALB: %v", err)
 		}
-		fmt.Printf("Created EC2 instance with ID: %s\n", instanceID)
+		fmt.Printf("Created ALB with ARN: %s\n", albARN)
 	}
 
 	return nil
 }
 
-// handleS3Bucket manages the S3 bucket
-func handleS3Bucket(client *s3.Client, desired ConfigResourcesS3Bucket) error {
-	bucketName := desired.Name
-	uniqueBucketName, err := getUniqueBucketName(client, bucketName)
-	if err != nil {
-		return fmt.Errorf("failed to get unique bucket name: %v", err)
-	}
-
-	if uniqueBucketName != bucketName {
-		fmt.Printf("Bucket name '%s' already exists. Using '%s' instead.\n", bucketName, uniqueBucketName)
-	}
-
-	err = createS3Bucket(client, uniqueBucketName, desired.ACL, desired.Tags)
-	if err != nil {
-		return fmt.Errorf("failed to create S3 bucket: %v", err)
-	}
-	fmt.Printf("Created S3 bucket: %s\n", uniqueBucketName)
-
-	return nil
-}
-
-// getUniqueBucketName finds a unique bucket name by appending a number if necessary
-func getUniqueBucketName(client *s3.Client, baseName string) (string, error) {
-	name := baseName
-	for i := 0; i < 10; i++ { // Try up to 10 times
-		exists, err := checkS3BucketExists(client, name)
-		if err != nil {
-			return "", fmt.Errorf("failed to check bucket existence: %v", err)
-		}
-		if !exists {
-			return name, nil
-		}
-		name = fmt.Sprintf("%s-%d", baseName, i+1)
-	}
-	return "", fmt.Errorf("could not find a unique bucket name after 10 attempts")
-}
-
-// checkS3BucketExists checks if an S3 bucket exists
-func checkS3BucketExists(client *s3.Client, bucketName string) (bool, error) {
-	_, err := client.HeadBucket(context.TODO(), &s3.HeadBucketInput{
-		Bucket: aws.String(bucketName),
+// findALBByName checks if an ALB with the given name already exists
+func findALBByName(client *elasticloadbalancingv2.Client, name string) (string, *elbv2types.LoadBalancer, error) {
+	result, err := client.DescribeLoadBalancers(context.TODO(), &elasticloadbalancingv2.DescribeLoadBalancersInput{
+		Names: []string{name},
 	})
 	if err != nil {
-		var notFound *types.NotFound
+		var notFound *elbv2types.LoadBalancerNotFoundException
 		if errors.As(err, &notFound) {
-			return false, nil
+			return "", nil, nil
 		}
-		return false, fmt.Errorf("failed to check bucket existence: %v", err)
+		return "", nil, fmt.Errorf("failed to describe ALB: %v", err)
 	}
-	return true, nil
+
+	if len(result.LoadBalancers) > 0 {
+		return *result.LoadBalancers[0].LoadBalancerArn, &result.LoadBalancers[0], nil
+	}
+
+	return "", nil, nil
 }
 
-// createS3Bucket creates an S3 bucket with retry logic
-func createS3Bucket(client *s3.Client, bucketName, acl string, tags map[string]string) error {
-	err := retry.Do(
-		func() error {
-			_, err := client.CreateBucket(context.TODO(), &s3.CreateBucketInput{
-				Bucket: aws.String(bucketName),
-				ACL:    types.BucketCannedACL(acl),
-			})
-			if err != nil {
-				return fmt.Errorf("failed to create bucket: %v", err)
-			}
+// compareALBStates compares the current and desired states of an ALB
+func compareALBStates(current *elbv2types.LoadBalancer, desired ConfigResourcesALB) []string {
+	var changes []string
 
-			// Add tags to the bucket
-			if len(tags) > 0 {
-				tagSet := make([]types.Tag, 0, len(tags))
-				for key, value := range tags {
-					tagSet = append(tagSet, types.Tag{
-						Key:   aws.String(key),
-						Value: aws.String(value),
-					})
-				}
-				_, err = client.PutBucketTagging(context.TODO(), &s3.PutBucketTaggingInput{
-					Bucket: aws.String(bucketName),
-					Tagging: &types.Tagging{
-						TagSet: tagSet,
-					},
-				})
-				if err != nil {
-					return fmt.Errorf("failed to add tags to bucket: %v", err)
-				}
-			}
+	if *current.Scheme != desired.Scheme {
+		changes = append(changes, fmt.Sprintf("Scheme: %s -> %s", *current.Scheme, desired.Scheme))
+	}
 
-			return nil
-		},
-		retry.Attempts(3),
-		retry.Delay(2*time.Second),
-		retry.OnRetry(func(n uint, err error) {
-			log.Printf("Retry %d: %v", n, err)
-		}),
-	)
-	return err
+	// Compare subnets (simplified)
+	if len(current.AvailabilityZones) != len(desired.Subnets) {
+		changes = append(changes, fmt.Sprintf("Subnets: %v -> %v", current.AvailabilityZones, desired.Subnets))
+	}
+
+	// Compare security groups (simplified)
+	if len(current.SecurityGroups) != len(desired.SecurityGroups) {
+		changes = append(changes, fmt.Sprintf("Security Groups: %v -> %v", current.SecurityGroups, desired.SecurityGroups))
+	}
+
+	// Compare tags (simplified)
+	currentTags := make(map[string]string)
+	for _, tag := range current.Tags {
+		currentTags[*tag.Key] = *tag.Value
+	}
+	for key, value := range desired.Tags {
+		if currentTags[key] != value {
+			changes = append(changes, fmt.Sprintf("Tag %s: %s -> %s", key, currentTags[key], value))
+		}
+	}
+
+	return changes
 }
 
-// handleRDSInstance manages the RDS instance
-func handleRDSInstance(client *rds.Client, desired ConfigResourcesRDSInstance) error {
-	instanceID, currentState, err := findRDSInstanceByName(client, desired.Name)
+// createALB creates a new Application Load Balancer
+func createALB(client *elasticloadbalancingv2.Client, desired ConfigResourcesALB) (string, error) {
+	// Create the ALB
+	result, err := client.CreateLoadBalancer(context.TODO(), &elasticloadbalancingv2.CreateLoadBalancerInput{
+		Name:           aws.String(desired.Name),
+		Scheme:         elbv2types.LoadBalancerSchemeEnum(desired.Scheme),
+		Subnets:        desired.Subnets,
+		SecurityGroups: desired.SecurityGroups,
+		Tags:           convertTags(desired.Tags),
+	})
 	if err != nil {
-		return fmt.Errorf("failed to check for existing RDS instance: %v", err)
+		return "", fmt.Errorf("failed to create ALB: %v", err)
 	}
 
-	if instanceID != "" {
-		fmt.Printf("RDS instance already exists with ID: %s\n", instanceID)
-		fmt.Println("Current State:")
-		fmt.Printf("  Engine: %s\n", *currentState.Engine)
-		fmt.Printf("  Engine Version: %s\n", *currentState.EngineVersion)
-		fmt.Printf("  Instance Class: %s\n", *currentState.DBInstanceClass)
-		fmt.Printf("  Allocated Storage: %d\n", *currentState.AllocatedStorage)
-		fmt.Printf("  Tags: %v\n", currentState.TagList)
+	albARN := *result.LoadBalancers[0].LoadBalancerArn
 
-		changes := compareRDSStates(currentState, desired)
-		if len(changes) > 0 {
-			fmt.Println("\nChanges to be applied:")
-			for _, change := range changes {
-				fmt.Println(change)
-			}
-
-			fmt.Print("\nDo you want to apply these changes? (yes/no): ")
-			var approval string
-			fmt.Scanln(&approval)
-
-			if approval == "yes" {
-				err = updateRDSInstance(client, instanceID, desired)
-				if err != nil {
-					return fmt.Errorf("failed to update RDS instance: %v", err)
-				}
-				fmt.Println("Changes applied successfully.")
-			} else {
-				fmt.Println("Changes rejected.")
-			}
-		} else {
-			fmt.Println("No changes required.")
-		}
-	} else {
-		instanceID, err = createRDSInstance(client, desired)
+	// Create target groups
+	for _, tg := range desired.TargetGroups {
+		_, err := client.CreateTargetGroup(context.TODO(), &elasticloadbalancingv2.CreateTargetGroupInput{
+			Name:       aws.String(tg.Name),
+			Protocol:   elbv2types.ProtocolEnum(tg.Protocol),
+			Port:       aws.Int32(tg.Port),
+			VpcId:      aws.String("vpc-0123456789abcdef0"), // Replace with your VPC ID
+			HealthCheckPath: aws.String(tg.HealthCheckPath),
+			HealthCheckPort: aws.String(fmt.Sprintf("%d", tg.HealthCheckPort)),
+			HealthCheckIntervalSeconds: aws.Int32(tg.HealthCheckInterval),
+			HealthCheckTimeoutSeconds:  aws.Int32(tg.HealthCheckTimeout),
+			HealthyThresholdCount:      aws.Int32(tg.HealthyThreshold),
+			UnhealthyThresholdCount:    aws.Int32(tg.UnhealthyThreshold),
+		})
 		if err != nil {
-			return fmt.Errorf("failed to create RDS instance: %v", err)
+			return "", fmt.Errorf("failed to create target group: %v", err)
 		}
-		fmt.Printf("Created RDS instance with ID: %s\n", instanceID)
 	}
 
-	return nil
+	// Create listeners
+	for _, listener := range desired.Listeners {
+		targetGroupARN := fmt.Sprintf("arn:aws:elasticloadbalancing:%s:%s:targetgroup/%s", desired.Region, "123456789012", listener.DefaultAction.TargetGroup)
+		_, err := client.CreateListener(context.TODO(), &elasticloadbalancingv2.CreateListenerInput{
+			LoadBalancerArn: aws.String(albARN),
+			Protocol:        elbv2types.ProtocolEnum(listener.Protocol),
+			Port:            aws.Int32(listener.Port),
+			DefaultActions: []elbv2types.Action{
+				{
+					Type: elbv2types.ActionTypeEnum(listener.DefaultAction.Type),
+					TargetGroupArn: aws.String(targetGroupARN),
+				},
+			},
+		})
+		if err != nil {
+			return "", fmt.Errorf("failed to create listener: %v", err)
+		}
+	}
+
+	return albARN, nil
+}
+
+// convertTags converts a map of tags to AWS Tag format
+func convertTags(tags map[string]string) []elbv2types.Tag {
+	var awsTags []elbv2types.Tag
+	for key, value := range tags {
+		awsTags = append(awsTags, elbv2types.Tag{
+			Key:   aws.String(key),
+			Value: aws.String(value),
+		})
+	}
+	return awsTags
 }
