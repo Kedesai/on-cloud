@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -72,12 +74,6 @@ type Config struct {
 	} `yaml:"resources"`
 }
 
-// LaunchTemplate represents an EC2 launch template
-type LaunchTemplate struct {
-	Name    string `yaml:"name"`
-	Version string `yaml:"version"`
-}
-
 func main() {
 	// Load YAML configuration
 	configFile, err := os.ReadFile("infra.yaml")
@@ -111,191 +107,76 @@ func main() {
 	albClient := elasticloadbalancingv2.NewFromConfig(awsCfg)
 	asgClient := autoscaling.NewFromConfig(awsCfg)
 
+	// Use a WaitGroup to wait for all goroutines to complete
+	var wg sync.WaitGroup
+	errChan := make(chan error, 5) // Buffer for 5 errors (one per resource type)
+
 	// Handle EC2 Instance
 	if cfg.Resources.EC2Instance.Name != "" {
-		err = handleEC2Instance(ec2Client, cfg.Resources.EC2Instance)
-		if err != nil {
-			log.Printf("Failed to handle EC2 instance: %v", err)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := handleEC2Instance(ec2Client, cfg.Resources.EC2Instance)
+			if err != nil {
+				errChan <- fmt.Errorf("EC2 instance error: %v", err)
+			}
+		}()
 	}
 
 	// Handle S3 Bucket
 	if cfg.Resources.S3Bucket.Name != "" {
-		err = handleS3Bucket(s3Client, cfg.Resources.S3Bucket)
-		if err != nil {
-			log.Printf("Failed to handle S3 bucket: %v", err)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := handleS3Bucket(s3Client, cfg.Resources.S3Bucket)
+			if err != nil {
+				errChan <- fmt.Errorf("S3 bucket error: %v", err)
+			}
+		}()
 	}
 
 	// Handle RDS Instance
 	if cfg.Resources.RDSInstance.Name != "" {
-		err = handleRDSInstance(rdsClient, cfg.Resources.RDSInstance)
-		if err != nil {
-			log.Printf("Failed to handle RDS instance: %v", err)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := handleRDSInstance(rdsClient, cfg.Resources.RDSInstance)
+			if err != nil {
+				errChan <- fmt.Errorf("RDS instance error: %v", err)
+			}
+		}()
 	}
 
 	// Handle ALB
 	if cfg.Resources.ALB.Name != "" {
-		err = handleALB(albClient, cfg.Resources.ALB)
-		if err != nil {
-			log.Printf("Failed to handle ALB: %v", err)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := handleALB(albClient, cfg.Resources.ALB)
+			if err != nil {
+				errChan <- fmt.Errorf("ALB error: %v", err)
+			}
+		}()
 	}
 
 	// Handle Auto Scaling Group
 	if cfg.Resources.AutoScalingGroup.Name != "" {
-		err = handleAutoScalingGroup(asgClient, cfg.Resources.AutoScalingGroup)
-		if err != nil {
-			log.Printf("Failed to handle Auto Scaling Group: %v", err)
-		}
-	}
-}
-
-// handleAutoScalingGroup manages the Auto Scaling Group
-func handleAutoScalingGroup(client *autoscaling.Client, desired ConfigResourcesAutoScalingGroup) error {
-	asgName := desired.Name
-	asg, err := findAutoScalingGroupByName(client, asgName)
-	if err != nil {
-		return fmt.Errorf("failed to check for existing Auto Scaling Group: %v", err)
-	}
-
-	if asg != nil {
-		fmt.Printf("Auto Scaling Group already exists with name: %s\n", *asg.AutoScalingGroupName)
-		fmt.Println("Current State:")
-		fmt.Printf("  Min Size: %d\n", *asg.MinSize)
-		fmt.Printf("  Max Size: %d\n", *asg.MaxSize)
-		fmt.Printf("  Desired Capacity: %d\n", *asg.DesiredCapacity)
-		fmt.Printf("  Launch Template: %s\n", *asg.LaunchTemplate.LaunchTemplateName)
-		fmt.Printf("  VPC Zone Identifier: %v\n", asg.VPCZoneIdentifier)
-		fmt.Printf("  Target Group ARNs: %v\n", asg.TargetGroupARNs)
-		fmt.Printf("  Tags: %v\n", asg.Tags)
-
-		changes := compareASGStates(asg, desired)
-		if len(changes) > 0 {
-			fmt.Println("\nChanges to be applied:")
-			for _, change := range changes {
-				fmt.Println(change)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := handleAutoScalingGroup(asgClient, cfg.Resources.AutoScalingGroup)
+			if err != nil {
+				errChan <- fmt.Errorf("Auto Scaling Group error: %v", err)
 			}
-
-			fmt.Print("\nDo you want to apply these changes? (yes/no): ")
-			var approval string
-			fmt.Scanln(&approval)
-
-			if approval == "yes" {
-				err = updateAutoScalingGroup(client, asgName, desired)
-				if err != nil {
-					return fmt.Errorf("failed to update Auto Scaling Group: %v", err)
-				}
-				fmt.Println("Changes applied successfully.")
-			} else {
-				fmt.Println("Changes rejected.")
-			}
-		} else {
-			fmt.Println("No changes required.")
-		}
-	} else {
-		err = createAutoScalingGroup(client, desired)
-		if err != nil {
-			return fmt.Errorf("failed to create Auto Scaling Group: %v", err)
-		}
-		fmt.Printf("Created Auto Scaling Group: %s\n", asgName)
+		}()
 	}
 
-	return nil
-}
+	// Wait for all goroutines to complete
+	wg.Wait()
+	close(errChan) // Close the error channel
 
-// findAutoScalingGroupByName checks if an Auto Scaling Group with the given name already exists
-func findAutoScalingGroupByName(client *autoscaling.Client, name string) (*autoscalingtypes.AutoScalingGroup, error) {
-	result, err := client.DescribeAutoScalingGroups(context.TODO(), &autoscaling.DescribeAutoScalingGroupsInput{
-		AutoScalingGroupNames: []string{name},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to describe Auto Scaling Group: %v", err)
+	// Collect and log errors
+	for err := range errChan {
+		log.Println(err)
 	}
-
-	if len(result.AutoScalingGroups) > 0 {
-		return &result.AutoScalingGroups[0], nil
-	}
-
-	return nil, nil
-}
-
-// compareASGStates compares the current and desired states of an Auto Scaling Group
-func compareASGStates(current *autoscalingtypes.AutoScalingGroup, desired ConfigResourcesAutoScalingGroup) []string {
-	var changes []string
-
-	if *current.MinSize != desired.MinSize {
-		changes = append(changes, fmt.Sprintf("Min Size: %d -> %d", *current.MinSize, desired.MinSize))
-	}
-
-	if *current.MaxSize != desired.MaxSize {
-		changes = append(changes, fmt.Sprintf("Max Size: %d -> %d", *current.MaxSize, desired.MaxSize))
-	}
-
-	if *current.DesiredCapacity != desired.DesiredCapacity {
-		changes = append(changes, fmt.Sprintf("Desired Capacity: %d -> %d", *current.DesiredCapacity, desired.DesiredCapacity))
-	}
-
-	if *current.LaunchTemplate.LaunchTemplateName != desired.LaunchTemplate.Name {
-		changes = append(changes, fmt.Sprintf("Launch Template: %s -> %s", *current.LaunchTemplate.LaunchTemplateName, desired.LaunchTemplate.Name))
-	}
-
-	// Compare VPC Zone Identifier (simplified)
-	if len(current.VPCZoneIdentifier) != len(desired.VpcZoneIdentifier) {
-		changes = append(changes, fmt.Sprintf("VPC Zone Identifier: %v -> %v", current.VPCZoneIdentifier, desired.VpcZoneIdentifier))
-	}
-
-	// Compare Target Group ARNs (simplified)
-	if len(current.TargetGroupARNs) != len(desired.TargetGroupARNs) {
-		changes = append(changes, fmt.Sprintf("Target Group ARNs: %v -> %v", current.TargetGroupARNs, desired.TargetGroupARNs))
-	}
-
-	// Compare tags (simplified)
-	currentTags := make(map[string]string)
-	for _, tag := range current.Tags {
-		currentTags[*tag.Key] = *tag.Value
-	}
-	for key, value := range desired.Tags {
-		if currentTags[key] != value {
-			changes = append(changes, fmt.Sprintf("Tag %s: %s -> %s", key, currentTags[key], value))
-		}
-	}
-
-	return changes
-}
-
-// createAutoScalingGroup creates a new Auto Scaling Group
-func createAutoScalingGroup(client *autoscaling.Client, desired ConfigResourcesAutoScalingGroup) error {
-	// Create the Auto Scaling Group
-	_, err := client.CreateAutoScalingGroup(context.TODO(), &autoscaling.CreateAutoScalingGroupInput{
-		AutoScalingGroupName: aws.String(desired.Name),
-		MinSize:              aws.Int32(desired.MinSize),
-		MaxSize:              aws.Int32(desired.MaxSize),
-		DesiredCapacity:      aws.Int32(desired.DesiredCapacity),
-		LaunchTemplate: &autoscalingtypes.LaunchTemplateSpecification{
-			LaunchTemplateName: aws.String(desired.LaunchTemplate.Name),
-			Version:           aws.String(desired.LaunchTemplate.Version),
-		},
-		VPCZoneIdentifier:  aws.String(strings.Join(desired.VpcZoneIdentifier, ",")),
-		TargetGroupARNs:    desired.TargetGroupARNs,
-		Tags:               convertASGTags(desired.Tags),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create Auto Scaling Group: %v", err)
-	}
-
-	return nil
-}
-
-// convertASGTags converts a map of tags to AWS Tag format
-func convertASGTags(tags map[string]string) []autoscalingtypes.Tag {
-	var awsTags []autoscalingtypes.Tag
-	for key, value := range tags {
-		awsTags = append(awsTags, autoscalingtypes.Tag{
-			Key:   aws.String(key),
-			Value: aws.String(value),
-		})
-	}
-	return awsTags
 }
