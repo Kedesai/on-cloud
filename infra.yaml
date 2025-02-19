@@ -1,0 +1,13 @@
+provider: aws
+region: us-west-2
+resources:
+  ec2_instance:
+    name: my-ec2-instance
+    instance_type: t2.micro
+    ami: ami-0c55b159cbfafe1f0  # Amazon Linux 2 AMI
+    key_name: my-key-pair
+    security_groups:
+      - default
+    tags:
+      Environment: Development
+      Project: MyProject
