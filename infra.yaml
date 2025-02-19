@@ -58,3 +58,20 @@ resources:
     tags:
       Environment: Development
       Project: MyProject
+
+  autoscaling_group:
+    name: my-asg
+    min_size: 1
+    max_size: 3
+    desired_capacity: 2
+    launch_template:
+      name: my-launch-template
+      version: "$Latest"
+    vpc_zone_identifier:
+      - subnet-0123456789abcdef0
+      - subnet-0123456789abcdef1
+    target_group_arns:
+      - arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/my-target-group/0123456789abcdef
+    tags:
+      Environment: Development
+      Project: MyProject
