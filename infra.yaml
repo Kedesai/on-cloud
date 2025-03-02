@@ -5,9 +5,13 @@ resources:
     name: my-ec2-instance
     instance_type: t2.micro
     ami: ami-0c55b159cbfafe1f0  # Amazon Linux 2 AMI
-    key_name: my-key-pair
+    key_name: id_ed25519.pub
     security_groups:
-      - default
+      - sg-0123456789abcdef0
+    subnet_id: subnet-0123456789abcdef0  # Added
+    vpc_security_group_ids:  # Added
+      - sg-0123456789abcdef0
+    monitoring: true  # Added
     tags:
       Environment: Development
       Project: MyProject
@@ -75,3 +79,68 @@ resources:
     tags:
       Environment: Development
       Project: MyProject
+
+  iam_role:
+    name: my-iam-role
+    assume_role_policy: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "ec2.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      }
+    policies:
+      - name: my-ec2-policy
+        policy: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ec2:DescribeInstances",
+                  "ec2:RunInstances",
+                  "ec2:TerminateInstances"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+      - name: my-s3-policy
+        policy: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:CreateBucket",
+                  "s3:DeleteBucket",
+                  "s3:ListBucket"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+      - name: my-rds-policy
+        policy: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "rds:CreateDBInstance",
+                  "rds:DeleteDBInstance",
+                  "rds:DescribeDBInstances"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
