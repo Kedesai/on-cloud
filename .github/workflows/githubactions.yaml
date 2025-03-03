@@ -2,8 +2,8 @@ name: Run go4gold
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # Runs at midnight UTC every day
-  workflow_dispatch:  # Allows manual triggering
+    - cron: '0 9 * * *'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -16,7 +16,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.21'  # Replace with your Go version
+          go-version: '1.21'
 
       - name: Install dependencies
         run: |
