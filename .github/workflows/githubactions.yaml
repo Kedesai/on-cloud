@@ -1,38 +1,32 @@
 name: Run go4gold
 
 on:
-  push:
-    branches:
-      - main
-
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
 jobs:
-  run-tool:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: "1.20"
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          go-version: '1.21'
 
       - name: Install dependencies
         run: |
           go mod tidy
 
-      - name: Build Go application
+      - name: Build Go binary
         run: |
-          go build -o go4gold
+          go build -o go4gold 
 
-      - name: Run infrastructure tool
-        run: |
-          ./go4gold 
-          #-config ./on-cloud/variables.yaml -infra ./on-cloud/infra.yaml
+      - name: Upload binary as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: go4gold
+          path: ./version/go4gold
