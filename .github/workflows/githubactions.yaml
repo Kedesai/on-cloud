@@ -30,4 +30,4 @@ jobs:
         uses: actions/upload-artifact@v3
         with:
           name: go4gold
-          path: ./version/go4gold
+          path: ./go4gold
