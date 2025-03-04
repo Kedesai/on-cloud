@@ -27,7 +27,7 @@ jobs:
           go build -o go4gold 
 
       - name: Upload binary as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: go4gold
           path: ./go4gold
