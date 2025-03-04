@@ -2,90 +2,45 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os"
-	"strings"
-	"sync"
 	"time"
 
+	"github.com/avast/retry-go"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
-	autoscalingtypes "github.com/aws/aws-sdk-go-v2/service/autoscaling/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
-	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
-	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
-	"github.com/aws/aws-sdk-go-v2/service/rds"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/iam"
-	"github.com/avast/retry-go"
 	"gopkg.in/yaml.v3"
 )
 
 // Config represents the YAML configuration
 type Config struct {
-	Provider string `yaml:"provider"`
-	Region   string `yaml:"region"`
+	Provider  string `yaml:"provider"`
+	Region    string `yaml:"region"`
 	Resources struct {
-		EC2Instance struct {
-			Name           string            `yaml:"name"`
-			InstanceType   string            `yaml:"instance_type"`
-			AMI            string            `yaml:"ami"`
-			KeyName        string            `yaml:"key_name"`
-			SecurityGroups []string          `yaml:"security_groups"`
-			Tags           map[string]string `yaml:"tags"`
-		} `yaml:"ec2_instance"`
-		S3Bucket struct {
-			Name string            `yaml:"name"`
-			ACL  string            `yaml:"acl"`
-			Tags map[string]string `yaml:"tags"`
-		} `yaml:"s3_bucket"`
-		RDSInstance struct {
-			Name             string            `yaml:"name"`
-			Engine           string            `yaml:"engine"`
-			EngineVersion    string            `yaml:"engine_version"`
-			InstanceClass    string            `yaml:"instance_class"`
-			AllocatedStorage int32             `yaml:"allocated_storage"`
-			Username         string            `yaml:"username"`
-			Password         string            `yaml:"password"`
-			Tags             map[string]string `yaml:"tags"`
-		} `yaml:"rds_instance"`
-		ALB struct {
-			Name            string            `yaml:"name"`
-			Scheme          string            `yaml:"scheme"`
-			Subnets         []string          `yaml:"subnets"`
-			SecurityGroups  []string          `yaml:"security_groups"`
-			Listeners       []Listener        `yaml:"listeners"`
-			TargetGroups    []TargetGroup     `yaml:"target_groups"`
-			Tags            map[string]string `yaml:"tags"`
-		} `yaml:"alb"`
-		AutoScalingGroup struct {
-			Name               string            `yaml:"name"`
-			MinSize            int32             `yaml:"min_size"`
-			MaxSize            int32             `yaml:"max_size"`
-			DesiredCapacity    int32             `yaml:"desired_capacity"`
-			LaunchTemplate     LaunchTemplate    `yaml:"launch_template"`
-			VpcZoneIdentifier  []string          `yaml:"vpc_zone_identifier"`
-			TargetGroupARNs    []string          `yaml:"target_group_arns"`
-			Tags               map[string]string `yaml:"tags"`
-		} `yaml:"autoscaling_group"`
-		IAMRole struct {
-			Name             string `yaml:"name"`
-			AssumeRolePolicy string `yaml:"assume_role_policy"`
-			Policies         []struct {
-				Name   string `yaml:"name"`
-				Policy string `yaml:"policy"`
-			} `yaml:"policies"`
-		} `yaml:"iam_role"`
+		EC2Instance EC2InstanceConfig `yaml:"ec2_instance"`
 	} `yaml:"resources"`
+}
+
+// EC2InstanceConfig represents the EC2 instance configuration
+type EC2InstanceConfig struct {
+	Name                string            `yaml:"name"`
+	InstanceType        string            `yaml:"instance_type"`
+	AMI                 string            `yaml:"ami"`
+	KeyName             string            `yaml:"key_name"`
+	SecurityGroups      []string          `yaml:"security_groups"`
+	SubnetID            string            `yaml:"subnet_id"`
+	VPCSecurityGroupIDs []string          `yaml:"vpc_security_group_ids"`
+	Monitoring          bool              `yaml:"monitoring"`
+	Tags                map[string]string `yaml:"tags"`
+	DesiredCount        int               `yaml:"desired_count"` // Number of instances to maintain
 }
 
 // Variables represents the variable file
 type Variables struct {
-	Region string `yaml:"region"`
+	Region      string `yaml:"region"`
 	EC2Instance struct {
 		KeyName             string   `yaml:"key_name"`
 		AMI                 string   `yaml:"ami"`
@@ -93,14 +48,8 @@ type Variables struct {
 		SubnetID            string   `yaml:"subnet_id"`
 		VPCSecurityGroupIDs []string `yaml:"vpc_security_group_ids"`
 		Monitoring          bool     `yaml:"monitoring"`
+		DesiredCount        int      `yaml:"desired_count"`
 	} `yaml:"ec2_instance"`
-	RDSInstance struct {
-		Username string `yaml:"username"`
-		Password string `yaml:"password"`
-	} `yaml:"rds_instance"`
-	ALB struct {
-		SecurityGroups []string `yaml:"security_groups"`
-	} `yaml:"alb"`
 }
 
 func main() {
@@ -148,6 +97,9 @@ func main() {
 	if vars.EC2Instance.Monitoring {
 		cfg.Resources.EC2Instance.Monitoring = vars.EC2Instance.Monitoring
 	}
+	if vars.EC2Instance.DesiredCount > 0 {
+		cfg.Resources.EC2Instance.DesiredCount = vars.EC2Instance.DesiredCount
+	}
 
 	// Validate configuration
 	if cfg.Provider != "aws" {
@@ -155,6 +107,9 @@ func main() {
 	}
 	if cfg.Region == "" {
 		log.Fatal("Region is required")
+	}
+	if cfg.Resources.EC2Instance.DesiredCount <= 0 {
+		log.Fatal("DesiredCount must be greater than 0")
 	}
 
 	// Initialize AWS SDK
@@ -164,47 +119,75 @@ func main() {
 	}
 
 	ec2Client := ec2.NewFromConfig(awsCfg)
-	iamClient := iam.NewFromConfig(awsCfg)
 
-	// Use a WaitGroup to wait for all goroutines to complete
-	var wg sync.WaitGroup
-	errChan := make(chan error, 2) // Buffer for errors (one per resource type)
-
-	// Handle EC2 Instance
-	if cfg.Resources.EC2Instance.Name != "" {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := handleEC2Instance(ec2Client, cfg.Resources.EC2Instance)
-			if err != nil {
-				errChan <- fmt.Errorf("EC2 instance error: %v", err)
-			}
-		}()
+	// Check if the desired number of instances already exist
+	existingInstances, err := getExistingInstances(ec2Client, cfg.Resources.EC2Instance.Name)
+	if err != nil {
+		log.Fatalf("Failed to check existing instances: %v", err)
 	}
 
-	// Handle IAM Role
-	if cfg.Resources.IAMRole.Name != "" {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := handleIAMRole(iamClient, cfg)
-			if err != nil {
-				errChan <- fmt.Errorf("IAM role error: %v", err)
-			}
-		}()
+	// Print what the script is going to do
+	fmt.Printf("Checking existing EC2 instances with the name '%s'...\n", cfg.Resources.EC2Instance.Name)
+	fmt.Printf("Found %d instances already running or pending.\n", len(existingInstances))
+	fmt.Printf("Desired number of instances: %d\n", cfg.Resources.EC2Instance.DesiredCount)
+
+	if len(existingInstances) >= cfg.Resources.EC2Instance.DesiredCount {
+		fmt.Println("No action needed. The desired number of instances already exist.")
+		return
 	}
 
-	// Wait for all goroutines to complete
-	wg.Wait()
-	close(errChan) // Close the error channel
+	// Calculate how many instances need to be created
+	instancesToCreate := cfg.Resources.EC2Instance.DesiredCount - len(existingInstances)
+	fmt.Printf("Creating %d new EC2 instances...\n", instancesToCreate)
 
-	// Collect and log errors
-	for err := range errChan {
-		log.Println(err)
+	// Create the required number of instances
+	for i := 0; i < instancesToCreate; i++ {
+		fmt.Printf("Creating instance %d of %d...\n", i+1, instancesToCreate)
+		err := handleEC2InstanceWithRetry(ec2Client, cfg.Resources.EC2Instance)
+		if err != nil {
+			log.Fatalf("Failed to create EC2 instance: %v", err)
+		}
 	}
+
+	fmt.Println("EC2 instance creation completed successfully.")
 }
 
-func handleEC2Instance(client *ec2.Client, instanceConfig Config.Resources.EC2Instance) error {
+// getExistingInstances checks for existing instances with the given name tag
+func getExistingInstances(client *ec2.Client, name string) ([]types.Instance, error) {
+	input := &ec2.DescribeInstancesInput{
+		Filters: []types.Filter{
+			{
+				Name:   aws.String("tag:Name"),
+				Values: []string{name},
+			},
+			{
+				Name:   aws.String("instance-state-name"),
+				Values: []string{"running", "pending"},
+			},
+		},
+	}
+
+	result, err := client.DescribeInstances(context.TODO(), input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to describe instances: %v", err)
+	}
+
+	var instances []types.Instance
+	for _, reservation := range result.Reservations {
+		instances = append(instances, reservation.Instances...)
+	}
+
+	return instances, nil
+}
+
+func handleEC2Instance(client *ec2.Client, instanceConfig EC2InstanceConfig) error {
+	if instanceConfig.SubnetID == "" {
+		return fmt.Errorf("subnet ID is required")
+	}
+	if len(instanceConfig.VPCSecurityGroupIDs) == 0 {
+		return fmt.Errorf("VPC security group IDs are required")
+	}
+
 	input := &ec2.RunInstancesInput{
 		ImageId:          aws.String(instanceConfig.AMI),
 		InstanceType:     types.InstanceType(instanceConfig.InstanceType),
@@ -218,9 +201,9 @@ func handleEC2Instance(client *ec2.Client, instanceConfig Config.Resources.EC2In
 		},
 		NetworkInterfaces: []types.InstanceNetworkInterfaceSpecification{
 			{
-				DeviceIndex:         aws.Int32(0),
-				SubnetId:           aws.String(instanceConfig.SubnetID),
-				Groups:             instanceConfig.VPCSecurityGroupIDs,
+				DeviceIndex:              aws.Int32(0),
+				SubnetId:                 aws.String(instanceConfig.SubnetID),
+				Groups:                   instanceConfig.VPCSecurityGroupIDs,
 				AssociatePublicIpAddress: aws.Bool(true),
 			},
 		},
@@ -237,38 +220,18 @@ func handleEC2Instance(client *ec2.Client, instanceConfig Config.Resources.EC2In
 		return fmt.Errorf("failed to create EC2 instance: %v", err)
 	}
 
-	log.Printf("EC2 instance '%s' created successfully", instanceConfig.Name)
+	fmt.Printf("EC2 instance '%s' created successfully.\n", instanceConfig.Name)
 	return nil
 }
 
-func handleIAMRole(client *iam.Client, cfg Config) error {
-	// Create the IAM role
-	createRoleInput := &iam.CreateRoleInput{
-		RoleName:                 aws.String(cfg.Resources.IAMRole.Name),
-		AssumeRolePolicyDocument: aws.String(cfg.Resources.IAMRole.AssumeRolePolicy),
-	}
-
-	_, err := client.CreateRole(context.TODO(), createRoleInput)
-	if err != nil {
-		return fmt.Errorf("failed to create IAM role: %v", err)
-	}
-
-	// Attach policies to the role
-	for _, policy := range cfg.Resources.IAMRole.Policies {
-		putPolicyInput := &iam.PutRolePolicyInput{
-			RoleName:       aws.String(cfg.Resources.IAMRole.Name),
-			PolicyName:     aws.String(policy.Name),
-			PolicyDocument: aws.String(policy.Policy),
-		}
-
-		_, err := client.PutRolePolicy(context.TODO(), putPolicyInput)
-		if err != nil {
-			return fmt.Errorf("failed to attach policy %s: %v", policy.Name, err)
-		}
-	}
-
-	log.Printf("IAM role '%s' created successfully", cfg.Resources.IAMRole.Name)
-	return nil
+func handleEC2InstanceWithRetry(client *ec2.Client, instanceConfig EC2InstanceConfig) error {
+	return retry.Do(
+		func() error {
+			return handleEC2Instance(client, instanceConfig)
+		},
+		retry.Attempts(3),          // Retry 3 times
+		retry.Delay(2*time.Second), // Delay between retries
+	)
 }
 
 func convertTags(tags map[string]string) []types.Tag {
