@@ -20,6 +20,10 @@ jobs:
 
       - name: Install dependencies
         run: |
+          go mod init go4gold
+          
+      - name: Initialize module
+        run: |
           go mod tidy
 
       - name: Build Go binary
