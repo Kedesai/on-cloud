@@ -1,0 +1,17 @@
+provider: aws
+region: us-east-1
+resources:
+  ec2_instance:
+    name: my-ec2-instance
+    instance_type: t2.micro
+    ami: "" # Removing the default AMI
+    key_name: Ketan-key-ed
+    vpc_security_group_ids:
+      - sg-0478008ddf556576e # Replace with your ACTUAL VPC security group ID
+    monitoring: false
+    tags:
+      Environment: Production
+      Project: MyProject
+    desired_count: 1
+    os: amazonLinux2 # Setting a default OS here
+subnet_id: subnet-0c61dc0d88fa59519 # Your ACTUAL subnet ID
